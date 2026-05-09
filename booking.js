@@ -1,24 +1,28 @@
 const fetch = require("node-fetch");
 
-const BOOKING_MCP_URL = "https://demandapi-mcp.booking.com/v1/mcp/8132308";
-
 async function searchHotels({ destination, checkin, checkout, adults, children_ages }) {
   console.log(`🔍 Searching: ${destination} | ${checkin} → ${checkout} | Adults: ${adults}`);
 
   try {
-    const prompt = `Search for the top 5 hotels in ${destination} from ${checkin} to ${checkout} for ${adults} adults${children_ages && children_ages.length > 0 ? ` and ${children_ages.length} children ages ${children_ages.join(", ")}` : ""}.
+    // Use Claude to generate realistic hotel recommendations
+    const prompt = `You are a hotel expert. Suggest 4 realistic hotels in ${destination} for a trip from ${checkin} to ${checkout} for ${adults} adults${children_ages && children_ages.length > 0 ? ` and children ages ${children_ages.join(", ")}` : ""}.
 
-Respond ONLY with a valid JSON array. No text before or after. No markdown. Just the JSON array:
+Use your knowledge of real hotels in this destination. Prefer 4-5 star family-friendly hotels.
+
+Calculate nights between ${checkin} and ${checkout} and multiply by price_per_night to get total_price.
+
+Respond ONLY with a valid JSON array, no markdown, no extra text:
 [
   {
-    "name": "Hotel Name",
+    "name": "Real Hotel Name",
     "stars": 5,
     "rating": 8.9,
-    "price_per_night": 500,
-    "total_price": 2500,
+    "price_per_night": 600,
+    "total_price": 3000,
     "currency": "SAR",
-    "highlights": ["pool", "beach", "kids club"],
-    "url": "https://www.booking.com/hotel/..."
+    "area": "Area name in ${destination}",
+    "highlights": ["pool", "kids club", "beach"],
+    "url": "https://www.booking.com/searchresults.html?ss=${encodeURIComponent(destination)}&checkin=${checkin}&checkout=${checkout}&group_adults=${adults}&no_rooms=1"
   }
 ]`;
 
@@ -31,68 +35,84 @@ Respond ONLY with a valid JSON array. No text before or after. No markdown. Just
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 2000,
+        max_tokens: 1500,
         messages: [{ role: "user", content: prompt }],
-        mcp_servers: [{ type: "url", url: BOOKING_MCP_URL, name: "booking" }],
       }),
     });
 
     const data = await response.json();
-    console.log(`📦 Booking API status: ${response.status}`);
+    console.log(`📦 Search API status: ${response.status}`);
 
     if (data.error) {
-      console.error(`❌ Booking API error: ${JSON.stringify(data.error)}`);
-      return getFallbackHotels(destination, checkin, checkout);
+      console.error(`❌ Search API error: ${JSON.stringify(data.error)}`);
+      return getBookingLinks(destination, checkin, checkout, adults);
     }
 
-    // Extract all text blocks
     const textBlocks = (data.content || [])
       .filter(b => b && b.type === "text")
       .map(b => b.text)
       .join("\n");
 
-    console.log(`📦 Raw response: ${textBlocks.substring(0, 300)}`);
+    console.log(`📦 Raw response preview: ${textBlocks.substring(0, 200)}`);
 
-    // Find JSON array in response
-    const match = textBlocks.match(/\[[\s\S]*?\]/);
+    // Clean and parse JSON
+    const clean = textBlocks.replace(/```json|```/g, "").trim();
+    const match = clean.match(/\[[\s\S]*\]/);
     if (!match) {
-      console.log("⚠️ No JSON array found in response, using fallback");
-      return getFallbackHotels(destination, checkin, checkout);
+      console.log("⚠️ No JSON found, using booking links");
+      return getBookingLinks(destination, checkin, checkout, adults);
     }
 
     const hotels = JSON.parse(match[0]);
-    console.log(`✅ Found ${hotels.length} hotels`);
-    return hotels;
+    
+    // Ensure all hotels have proper booking URLs
+    return hotels.map(h => ({
+      ...h,
+      url: `https://www.booking.com/searchresults.html?ss=${encodeURIComponent(h.name + " " + destination)}&checkin=${checkin}&checkout=${checkout}&group_adults=${adults}&no_rooms=1`
+    }));
 
   } catch (err) {
     console.error(`❌ searchHotels error: ${err.message}`);
-    return getFallbackHotels(destination, checkin, checkout);
+    return getBookingLinks(destination, checkin, checkout, adults);
   }
 }
 
-// Fallback hotels when search fails
-function getFallbackHotels(destination, checkin, checkout) {
-  console.log(`⚠️ Using fallback hotels for ${destination}`);
+// Fallback: direct Booking.com search links
+function getBookingLinks(destination, checkin, checkout, adults) {
+  const baseUrl = `https://www.booking.com/searchresults.html?ss=${encodeURIComponent(destination)}&checkin=${checkin}&checkout=${checkout}&group_adults=${adults}&no_rooms=1`;
   return [
     {
-      name: `Search results for ${destination}`,
+      name: `5-star hotels in ${destination}`,
       stars: 5,
       rating: 9.0,
-      price_per_night: 800,
-      total_price: 4000,
+      price_per_night: 1200,
+      total_price: 6000,
       currency: "SAR",
-      highlights: ["pool", "beach", "family friendly"],
-      url: `https://www.booking.com/searchresults.html?ss=${encodeURIComponent(destination)}&checkin=${checkin}&checkout=${checkout}`
+      area: destination,
+      highlights: ["luxury", "pool", "spa"],
+      url: baseUrl + "&nflt=class%3D5"
     },
     {
-      name: `View all hotels in ${destination}`,
+      name: `4-star family resorts in ${destination}`,
       stars: 4,
       rating: 8.5,
-      price_per_night: 500,
-      total_price: 2500,
+      price_per_night: 700,
+      total_price: 3500,
       currency: "SAR",
-      highlights: ["great location", "good value"],
-      url: `https://www.booking.com/searchresults.html?ss=${encodeURIComponent(destination)}&checkin=${checkin}&checkout=${checkout}&nflt=class%3D4`
+      area: destination,
+      highlights: ["family friendly", "pool", "kids activities"],
+      url: baseUrl + "&nflt=class%3D4%3Bhotelfacility%3D28"
+    },
+    {
+      name: `Top-rated hotels in ${destination}`,
+      stars: 4,
+      rating: 8.8,
+      price_per_night: 900,
+      total_price: 4500,
+      currency: "SAR",
+      area: destination,
+      highlights: ["highly rated", "great location"],
+      url: baseUrl + "&nflt=review_score%3D80"
     }
   ];
 }
@@ -109,13 +129,15 @@ function formatHotelsTable(hotels, tripSegment) {
     const stars = "⭐".repeat(Math.min(h.stars || 0, 5));
     const highlights = (h.highlights || []).slice(0, 3).join(", ");
     table += `\n*${i + 1}. ${h.name}*\n`;
+    if (h.area) table += `📍 ${h.area}\n`;
     table += `${stars} | ⭐ ${h.rating}/10\n`;
     table += `💰 ${h.total_price} ${h.currency} total\n`;
     if (highlights) table += `✨ ${highlights}\n`;
+    table += `🔗 ${h.url}\n`;
   });
 
   table += `\n${"─".repeat(30)}\n`;
-  table += `Reply with a number to select (e.g. *1*)`;
+  table += `Reply with a number to book (e.g. *1*)`;
 
   return table;
 }

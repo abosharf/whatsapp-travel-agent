@@ -1,7 +1,62 @@
 const fetch = require("node-fetch");
-const { getSession, updateSession, addMessage } = require("./session");
+const fs = require("fs");
+const path = require("path");
 const { searchHotels, formatHotelsTable } = require("./booking");
 
+// ─── Session Storage (file-based so it survives restarts) ───────────────────
+const SESSION_FILE = path.join("/tmp", "sessions.json");
+
+function loadSessions() {
+  try {
+    if (fs.existsSync(SESSION_FILE)) {
+      return JSON.parse(fs.readFileSync(SESSION_FILE, "utf-8"));
+    }
+  } catch (e) {}
+  return {};
+}
+
+function saveSessions(sessions) {
+  try {
+    fs.writeFileSync(SESSION_FILE, JSON.stringify(sessions), "utf-8");
+  } catch (e) {
+    console.error("❌ Could not save sessions:", e.message);
+  }
+}
+
+function getSession(userId) {
+  const sessions = loadSessions();
+  if (!sessions[userId]) {
+    sessions[userId] = {
+      userId,
+      history: [],
+      lastHotels: {},
+      selectedHotels: [],
+      pendingSegments: [],
+      step: "idle",
+      searchParams: {},
+    };
+    saveSessions(sessions);
+  }
+  return sessions[userId];
+}
+
+function updateSession(userId, updates) {
+  const sessions = loadSessions();
+  sessions[userId] = { ...getSession(userId), ...updates };
+  saveSessions(sessions);
+}
+
+function addMessage(userId, role, content) {
+  const sessions = loadSessions();
+  const session = sessions[userId] || getSession(userId);
+  session.history = session.history || [];
+  session.history.push({ role, content });
+  if (session.history.length > 20) session.history = session.history.slice(-20);
+  sessions[userId] = session;
+  saveSessions(sessions);
+}
+
+// ─── Owner Preferences ───────────────────────────────────────────────────────
 const OWNER_PREFERENCES = `
 ## Hotel Preferences
 - Always prefer 4-star and 5-star hotels
@@ -42,9 +97,10 @@ Today's date: ${new Date().toISOString().split("T")[0]}
 IMPORTANT: When you have enough info, ALWAYS output the SEARCH_HOTELS line to trigger the search.
 `;
 
+// ─── Claude API Call ──────────────────────────────────────────────────────────
 async function callClaude(messages) {
-  console.log(`🤖 Calling Claude API with ${messages.length} messages`);
-  
+  console.log(`🤖 Calling Claude with ${messages.length} messages`);
+
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -61,48 +117,57 @@ async function callClaude(messages) {
   });
 
   const data = await response.json();
-  console.log(`🤖 Claude response status: ${response.status}`);
-  
-  if (data.error) {
-    console.error(`❌ Claude API error: ${JSON.stringify(data.error)}`);
-    throw new Error(`Claude API error: ${data.error.message}`);
-  }
-
-  const text = data.content?.find((b) => b.type === "text")?.text || "";
-  console.log(`🤖 Claude reply: ${text.substring(0, 200)}`);
+  if (data.error) throw new Error(data.error.message);
+  const text = data.content?.find(b => b.type === "text")?.text || "";
+  console.log(`🤖 Reply: ${text.substring(0, 150)}`);
   return text;
 }
 
+// ─── Main Handler ─────────────────────────────────────────────────────────────
 async function handleIncomingMessage(userId, message) {
-  console.log(`👤 Handling message from ${userId}: ${message}`);
+  console.log(`👤 From ${userId}: ${message}`);
   const session = getSession(userId);
-  addMessage(userId, "user", message);
 
-  // Handle hotel selection
-  if (session.step === "selecting" && session.pendingSegments?.length > 0) {
-    const choice = parseInt(message.trim()) - 1;
-    const currentSegment = session.pendingSegments[0];
-    const hotels = session.lastHotels[currentSegment.label] || [];
+  console.log(`📊 Session step: ${session.step} | Pending segments: ${session.pendingSegments?.length || 0}`);
 
-    if (!isNaN(choice) && hotels[choice]) {
-      const selected = hotels[choice];
-      const updatedSelected = [...(session.selectedHotels || []), { ...selected, segment: currentSegment.label }];
-      const remaining = session.pendingSegments.slice(1);
-      updateSession(userId, { pendingSegments: remaining, selectedHotels: updatedSelected });
+  // ── Handle hotel number selection ──
+  if (session.step === "selecting") {
+    const trimmed = message.trim();
+    const choice = parseInt(trimmed) - 1;
+    const pendingSegments = session.pendingSegments || [];
 
-      if (remaining.length > 0) {
-        return await searchNextSegment(userId, remaining[0]);
+    if (pendingSegments.length > 0 && !isNaN(choice) && choice >= 0) {
+      const currentSegment = pendingSegments[0];
+      const hotels = (session.lastHotels || {})[currentSegment.label] || [];
+
+      console.log(`🔢 User chose ${choice + 1} from ${hotels.length} hotels in ${currentSegment.label}`);
+
+      if (hotels[choice]) {
+        const selected = hotels[choice];
+        const updatedSelected = [...(session.selectedHotels || []), { ...selected, segment: currentSegment.label }];
+        const remaining = pendingSegments.slice(1);
+
+        updateSession(userId, {
+          pendingSegments: remaining,
+          selectedHotels: updatedSelected,
+        });
+
+        if (remaining.length > 0) {
+          console.log(`➡️ Moving to next segment: ${remaining[0].label}`);
+          return await searchNextSegment(userId, remaining[0]);
+        } else {
+          updateSession(userId, { step: "idle" });
+          return buildBookingSummary(updatedSelected);
+        }
       } else {
-        updateSession(userId, { step: "idle" });
-        return buildBookingSummary(updatedSelected);
+        return `❌ الرجاء اختيار رقم بين 1 و ${hotels.length}`;
       }
-    } else {
-      return `❌ Please reply with a number between 1 and ${hotels.length}`;
     }
   }
 
-  // Regular AI conversation
-  const reply = await callClaude(session.history);
+  // ── Regular conversation ──
+  addMessage(userId, "user", message);
+  const reply = await callClaude(getSession(userId).history);
   addMessage(userId, "assistant", reply);
 
   if (reply.includes("SEARCH_HOTELS:")) {
@@ -112,17 +177,17 @@ async function handleIncomingMessage(userId, message) {
   return reply;
 }
 
+// ─── Hotel Search ─────────────────────────────────────────────────────────────
 async function handleHotelSearch(userId, claudeReply) {
   try {
-    const match = claudeReply.match(/SEARCH_HOTELS:\s*({[\s\S]*?})\s*$/m);
+    const match = claudeReply.match(/SEARCH_HOTELS:\s*(\{[\s\S]*?\})\s*(?:\n|$)/m);
     if (!match) {
-      console.error("❌ Could not parse SEARCH_HOTELS from:", claudeReply);
-      return claudeReply.replace(/SEARCH_HOTELS:.*$/m, "").trim() || "Let me search for hotels for you...";
+      console.error("❌ Could not parse SEARCH_HOTELS");
+      return claudeReply.replace(/SEARCH_HOTELS:.*/m, "").trim();
     }
 
-    const searchData = JSON.parse(match[1]);
-    const segments = searchData.segments;
-    console.log(`🔍 Searching ${segments.length} hotel segments`);
+    const { segments } = JSON.parse(match[1]);
+    console.log(`🔍 Searching ${segments.length} segments`);
 
     updateSession(userId, {
       pendingSegments: segments,
@@ -133,8 +198,8 @@ async function handleHotelSearch(userId, claudeReply) {
 
     return await searchNextSegment(userId, segments[0]);
   } catch (err) {
-    console.error("❌ Search parse error:", err);
-    return "Sorry, I had trouble processing your request. Please try again.";
+    console.error("❌ handleHotelSearch error:", err.message);
+    return "عذراً، حدث خطأ. الرجاء المحاولة مرة أخرى.";
   }
 }
 
@@ -150,28 +215,30 @@ async function searchNextSegment(userId, segment) {
     children_ages: session.searchParams?.children_ages || [],
   });
 
-  const updatedHotels = { ...session.lastHotels, [segment.label]: hotels };
+  // Save hotels to session
+  const updatedHotels = { ...(session.lastHotels || {}), [segment.label]: hotels };
   updateSession(userId, { lastHotels: updatedHotels });
 
+  console.log(`✅ Saved ${hotels.length} hotels for "${segment.label}"`);
   return formatHotelsTable(hotels, segment.label);
 }
 
+// ─── Booking Summary ──────────────────────────────────────────────────────────
 function buildBookingSummary(selectedHotels) {
-  let msg = `✅ *Your Trip Summary*\n${"─".repeat(30)}\n\n`;
+  let msg = `✅ *ملخص رحلتك*\n──────────────────────\n\n`;
 
   selectedHotels.forEach((h, i) => {
-    msg += `*${i + 1}. ${h.segment}*\n`;
-    msg += `🏨 ${h.name}\n`;
-    msg += `💰 ${h.total_price} ${h.currency}\n`;
-    msg += `🔗 ${h.url}\n\n`;
+    const searchName = encodeURIComponent((h.name || "") + " " + (h.area || h.segment || ""));
+    const url = `https://www.booking.com/search.html?ss=${searchName}`;
+    msg += `*${i + 1}. ${h.name}*\n`;
+    msg += `💰 ${h.total_price} ${h.currency || "SAR"}\n`;
+    msg += `🔗 ${url}\n\n`;
   });
 
-  const total = selectedHotels.reduce((sum, h) => sum + (h.total_price || 0), 0);
+  const total = selectedHotels.reduce((s, h) => s + (h.total_price || 0), 0);
   const currency = selectedHotels[0]?.currency || "SAR";
-
-  msg += `${"─".repeat(30)}\n`;
-  msg += `💳 *Total: ${total} ${currency}*\n\n`;
-  msg += `Tap each link above to complete your booking on Booking.com 🎉`;
+  msg += `──────────────────────\n`;
+  msg += `💳 *الإجمالي: ${total} ${currency}*`;
 
   return msg;
 }
